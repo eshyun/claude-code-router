@@ -12,6 +12,17 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
+import { RetryConfig, RateLimitConfig, CircuitBreakerConfig } from "@/types/config";
+import {
+  retryWithBackoff,
+  DEFAULT_RETRY_CONFIG,
+  DEFAULT_RATE_LIMIT_CONFIG,
+} from "@/utils/retry";
+import {
+  CircuitBreakerRegistry,
+  CircuitBreakerOpenError,
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+} from "@/utils/circuit-breaker";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -27,9 +38,15 @@ declare module "fastify" {
 }
 
 /**
+ * Circuit breaker registry (module-level singleton)
+ * Lazily initialized on first request
+ */
+let circuitBreakerRegistry: CircuitBreakerRegistry | null = null;
+
+/**
  * Main handler for transformer endpoints
  * Coordinates the entire request processing flow: validate provider, handle request transformers,
- * send request, handle response transformers, format response
+ * send request with retry + circuit breaker, handle response transformers, format response
  */
 async function handleTransformerEndpoint(
   req: FastifyRequest,
@@ -40,6 +57,7 @@ async function handleTransformerEndpoint(
   const body = req.body as any;
   const providerName = req.provider!;
   const provider = fastify.providerService.getProvider(providerName);
+  const scenarioType = (req as any).scenarioType || 'default';
 
   // Validate provider exists
   if (!provider) {
@@ -50,6 +68,20 @@ async function handleTransformerEndpoint(
     );
   }
 
+  // Load retry, rate limit, and circuit breaker configs
+  const retryConfig = fastify.configService.get<RetryConfig>('retry') || DEFAULT_RETRY_CONFIG;
+  const rateLimitConfig = fastify.configService.get<RateLimitConfig>('rateLimit') || DEFAULT_RATE_LIMIT_CONFIG;
+  const cbConfig = fastify.configService.get<CircuitBreakerConfig>('circuitBreaker') || DEFAULT_CIRCUIT_BREAKER_CONFIG;
+
+  // Initialize circuit breaker registry if not already done
+  if (!circuitBreakerRegistry && cbConfig.enabled) {
+    circuitBreakerRegistry = new CircuitBreakerRegistry(cbConfig, fastify.log);
+  }
+
+  // Get or create circuit breaker for this provider+model
+  const cbKey = `${providerName},${body.model}`;
+  const circuitBreaker = circuitBreakerRegistry?.getOrCreate(cbKey) || null;
+
   try {
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
@@ -57,23 +89,29 @@ async function handleTransformerEndpoint(
       provider,
       transformer,
       req.headers,
-      {
-        req,
-      }
+      { req }
     );
 
-    // Send request to LLM provider
-    const response = await sendRequestToProvider(
-      requestBody,
-      config,
-      provider,
-      fastify,
-      bypass,
-      transformer,
-      {
-        req,
-      }
-    );
+    // Send request to LLM provider with retry + circuit breaker
+    let response: Response;
+    const sendRequest = async () =>
+      sendRequestToProvider(
+        requestBody,
+        config,
+        provider,
+        fastify,
+        bypass,
+        transformer,
+        { req }
+      );
+
+    if (circuitBreaker) {
+      response = await circuitBreaker.execute(() =>
+        retryWithBackoff(sendRequest, retryConfig, rateLimitConfig, fastify.log)
+      );
+    } else {
+      response = await retryWithBackoff(sendRequest, retryConfig, rateLimitConfig, fastify.log);
+    }
 
     // Process response transformer chain
     const finalResponse = await processResponseTransformers(
@@ -82,16 +120,21 @@ async function handleTransformerEndpoint(
       provider,
       transformer,
       bypass,
-      {
-        req,
-      }
+      { req }
     );
 
     // Format and return response
     return formatResponse(finalResponse, reply, body);
   } catch (error: any) {
     // Handle fallback if error occurs
-    if (error.code === 'provider_response_error') {
+    // Triggered by: provider_response_error OR circuit breaker OPEN
+    if (
+      error.code === 'provider_response_error' ||
+      error instanceof CircuitBreakerOpenError
+    ) {
+      fastify.log.warn(
+        `[Fallback] Triggered for ${scenarioType}: ${error.message}`
+      );
       const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
       if (fallbackResult) {
         return fallbackResult;
