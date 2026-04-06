@@ -137,6 +137,7 @@ async function main() {
         envOverrides = {
           ...envOverrides,
           ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/preset/${command}`,
+          // Don't set ANTHROPIC_AUTH_TOKEN for local server - let Claude Code use its default auth
         };
       } else if (provider) {
         // Handle api_base_url, remove /v1/messages suffix
